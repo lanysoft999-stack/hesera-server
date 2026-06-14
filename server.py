@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-HESERA PRO - Единый сервер (API + Telegram бот)
-Работает на Render Web Service или Koyeb
+HESERA PRO - Сервер с автопингом (не засыпает на Render)
 """
 
 import json
@@ -9,6 +8,8 @@ import os
 import random
 import string
 import threading
+import time
+import requests
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -22,6 +23,9 @@ BOT_TOKEN = "8786847551:AAH6oMxtKrna7rv9RERbrkE9iFRi_vxWubA"
 ADMIN_IDS = [314148464]
 LICENSE_SECRET = "KLAMSI_PRO_2024_SECRET"
 DB_FILE = "hesera_database.json"
+
+# URL для автопинга (Render сам выдаст после деплоя)
+SELF_URL = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:5000')
 
 # ============================================
 # БАЗА ДАННЫХ
@@ -74,6 +78,19 @@ def validate_key_format(key):
     return part1 == expected and part2 == expected[::-1]
 
 # ============================================
+# АВТОПИНГ (чтобы Render не засыпал)
+# ============================================
+def auto_ping():
+    """Пингует сам себя каждые 5 минут"""
+    while True:
+        time.sleep(300)  # 5 минут = 300 секунд
+        try:
+            response = requests.get(f"{SELF_URL}/api/ping", timeout=10)
+            print(f"🔄 Автопинг: {response.status_code}")
+        except Exception as e:
+            print(f"⚠️ Ошибка автопинга: {e}")
+
+# ============================================
 # TELEGRAM БОТ
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -97,13 +114,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🛒 Купить ключ", callback_data='buy')],
         [InlineKeyboardButton("🔑 Мои ключи", callback_data='my_keys')],
         [InlineKeyboardButton("💰 Баланс", callback_data='balance')],
-        [InlineKeyboardButton("📱 Как активировать", callback_data='howto')],
-        [InlineKeyboardButton("ℹ️ Помощь", callback_data='help')]
+        [InlineKeyboardButton("📱 Как активировать", callback_data='howto')]
     ]
     
     await update.message.reply_text(
-        f"👑 *HESERA PRO - Магазин лицензий*\n\n"
-        f"Добро пожаловать, {user['first_name']}!\n"
+        f"👑 *HESERA PRO*\n\n"
         f"💰 Баланс: *{user['balance']} ₽*\n\n"
         f"Выберите действие:",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -123,10 +138,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db["users"][user_id]
     
     if user.get("banned"):
-        await query.edit_message_text("🚫 Ваш аккаунт заблокирован")
+        await query.edit_message_text("🚫 Заблокирован")
         return
     
-    # ========== МАГАЗИН ==========
     if query.data == 'buy':
         prices = {7: 149, 30: 449, 90: 999, 365: 2499}
         keyboard = [
@@ -137,189 +151,86 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("◀️ Назад", callback_data='back')]
         ]
         await query.edit_message_text(
-            f"🛒 *Выберите тариф:*\n\n"
-            f"💰 Ваш баланс: *{user['balance']} ₽*\n\n"
-            f"• 7 дней — {prices[7]} ₽ (~{prices[7]//7} ₽/день)\n"
-            f"• 30 дней — {prices[30]} ₽ (~{prices[30]//30} ₽/день)\n"
-            f"• 90 дней — {prices[90]} ₽ (~{prices[90]//90} ₽/день)\n"
-            f"• 365 дней — {prices[365]} ₽ (~{prices[365]//365} ₽/день)",
+            f"🛒 *Магазин*\n💰 Баланс: *{user['balance']} ₽*",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
     
-    # ========== ПОКУПКА ==========
     elif query.data.startswith('buy_'):
         days = int(query.data.split('_')[1])
         prices = {7: 149, 30: 449, 90: 999, 365: 2499}
         price = prices[days]
         
         if user["balance"] < price:
-            keyboard = [[InlineKeyboardButton("💰 Пополнить", callback_data='balance')],
-                       [InlineKeyboardButton("◀️ Назад", callback_data='buy')]]
-            await query.edit_message_text(
-                f"❌ *Недостаточно средств!*\n\n"
-                f"Нужно: {price} ₽\n"
-                f"Баланс: {user['balance']} ₽\n"
-                f"Не хватает: {price - user['balance']} ₽",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
+            await query.edit_message_text(f"❌ Недостаточно средств!\nНужно: {price} ₽\nБаланс: {user['balance']} ₽")
             return
         
-        # Списываем средства
         user["balance"] -= price
         db["stats"]["total_sales"] += price
         
-        # Генерируем ключ
         email = f"{user_id}@t.me"
         key = gen_license_key(days)
         
-        # Сохраняем лицензию
         db["licenses"][key.replace('-', '')] = {
-            "key": key,
-            "email": email,
-            "user_id": user_id,
-            "username": user["username"],
-            "days": days,
-            "price": price,
+            "key": key, "email": email, "user_id": user_id,
+            "username": user["username"], "days": days, "price": price,
             "created": datetime.now().isoformat(),
             "expires": (datetime.now() + timedelta(days=days)).isoformat(),
-            "activated": False,
-            "devices": [],
-            "activation_count": 0
+            "activated": False, "devices": []
         }
-        
-        # Привязываем ключ к email
         db["keys"][email] = key.replace('-', '')
-        
-        # Сохраняем покупку
-        db["payments"].append({
-            "user_id": user_id,
-            "type": "purchase",
-            "amount": price,
-            "days": days,
-            "key": key,
-            "date": datetime.now().isoformat()
-        })
-        
         save_db(db)
         
-        # Уведомление админу
         for admin_id in ADMIN_IDS:
             try:
-                await context.bot.send_message(
-                    admin_id,
-                    f"💰 *Продажа!*\n👤 {user['username']}\n🔑 `{key}`\n⏱ {days} дн.\n💵 {price} ₽",
-                    parse_mode='Markdown'
-                )
-            except:
-                pass
+                await context.bot.send_message(admin_id, f"💰 Продажа!\n👤 {user['username']}\n🔑 `{key}`\n⏱ {days} дн.\n💵 {price} ₽", parse_mode='Markdown')
+            except: pass
         
         await query.edit_message_text(
-            f"✅ *Покупка успешна!*\n\n"
-            f"🔑 Ключ: `{key}`\n"
-            f"📧 Привязан к: `{email}`\n"
-            f"⏱ Срок: {days} дней\n"
-            f"💰 Списано: {price} ₽\n\n"
-            f"📱 *Как активировать в приложении:*\n"
-            f"1. Откройте HESERA PRO\n"
-            f"2. Введите email: `{email}`\n"
-            f"3. Нажмите «Войти»\n\n"
-            f"Или введите ключ вручную",
+            f"✅ *Куплено!*\n\n🔑 `{key}`\n📧 `{email}`\n⏱ {days} дн.\n💰 -{price} ₽\n\n📱 Введите email в приложении",
             parse_mode='Markdown'
         )
     
-    # ========== МОИ КЛЮЧИ ==========
     elif query.data == 'my_keys':
-        user_licenses = [l for l in db["licenses"].values() if l["user_id"] == user_id]
-        
-        if not user_licenses:
-            await query.edit_message_text("🔑 У вас пока нет ключей.\nКупите в магазине!")
+        ls = [l for l in db["licenses"].values() if l["user_id"] == user_id]
+        if not ls:
+            await query.edit_message_text("🔑 Нет ключей")
             return
-        
-        text = "🔑 *Ваши ключи:*\n\n"
-        for lic in sorted(user_licenses, key=lambda x: x["created"], reverse=True)[:10]:
-            days_left = (datetime.fromisoformat(lic["expires"]) - datetime.now()).days
-            status = "✅" if days_left > 0 else "❌"
-            devices = len(lic.get("devices", []))
-            text += f"{status} `{lic['key']}`\n"
-            text += f"   📅 {lic['days']} дн. | 📱 {devices}/3 устр.\n"
-            if days_left > 0:
-                text += f"   ⏳ Осталось: {days_left} дн.\n"
-            text += "\n"
-        
-        keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data='back')]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        text = "🔑 *Ключи:*\n\n"
+        for l in sorted(ls, key=lambda x: x["created"], reverse=True)[:10]:
+            days = (datetime.fromisoformat(l["expires"]) - datetime.now()).days
+            text += f"• `{l['key']}` — {max(0,days)} дн.\n"
+        await query.edit_message_text(text, parse_mode='Markdown')
     
-    # ========== БАЛАНС ==========
     elif query.data == 'balance':
         await query.edit_message_text(
-            f"💰 *Баланс: {user['balance']} ₽*\n\n"
-            f"💳 Карта: `2202 2067 1487 9132`\n"
-            f"🏦 Сбербанк\n\n"
-            f"📌 После оплаты отправьте:\n"
-            f"`/paid СУММА`\n\n"
-            f"Например: `/paid 500`",
+            f"💰 *Баланс: {user['balance']} ₽*\n\n💳 `2202 2067 1487 9132` (Сбер)\n\n📌 `/paid СУММА`",
             parse_mode='Markdown'
         )
     
-    # ========== КАК АКТИВИРОВАТЬ ==========
     elif query.data == 'howto':
         await query.edit_message_text(
-            f"📱 *Как активировать HESERA PRO*\n\n"
-            f"1️⃣ Купите ключ в боте\n"
-            f"2️⃣ Откройте приложение\n"
-            f"3️⃣ Введите email: `{user_id}@t.me`\n"
-            f"4️⃣ Нажмите «Войти»\n\n"
-            f"🔑 Ключ на 3 устройствах\n"
-            f"💬 Поддержка: @heseracfg",
+            f"📱 *Активация:*\n\n1. Откройте HESERA PRO\n2. Введите: `{user_id}@t.me`\n3. Нажмите Войти\n\n💬 @heseracfg",
             parse_mode='Markdown'
         )
     
-    # ========== ПОМОЩЬ ==========
-    elif query.data == 'help':
-        await query.edit_message_text(
-            "ℹ️ *Помощь*\n\n"
-            "• Купите ключ в магазине\n"
-            "• Пополните баланс через СБП\n"
-            "• Активируйте в приложении\n"
-            "• Один ключ = 3 устройства\n\n"
-            "💬 @heseracfg",
-            parse_mode='Markdown'
-        )
-    
-    # ========== НАЗАД ==========
     elif query.data == 'back':
         await start(update, context)
 
-async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     try:
         amount = int(context.args[0])
         if amount <= 0 or amount > 10000:
             await update.message.reply_text("❌ Сумма от 1 до 10000 ₽")
             return
-        
         db = load_db()
         if user_id in db["users"]:
             db["users"][user_id]["balance"] += amount
-            db["payments"].append({
-                "user_id": user_id,
-                "type": "topup",
-                "amount": amount,
-                "date": datetime.now().isoformat()
-            })
             save_db(db)
             await update.message.reply_text(f"✅ +{amount} ₽\n💰 Баланс: {db['users'][user_id]['balance']} ₽")
-            
-            # Уведомление админу
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(admin_id, f"💰 Пополнение!\n👤 {user_id}\n💵 +{amount} ₽")
-                except:
-                    pass
     except:
-        await update.message.reply_text("❌ Используйте: `/paid СУММА`\nНапример: `/paid 500`")
+        await update.message.reply_text("❌ `/paid СУММА`\nНапример: `/paid 500`")
 
 # ============================================
 # FLASK API
@@ -329,10 +240,10 @@ CORS(flask_app)
 
 @flask_app.route('/')
 def index():
-    return jsonify({"service": "HESERA PRO API", "version": "1.0", "status": "running"})
+    return jsonify({"service": "HESERA PRO API", "status": "running"})
 
 @flask_app.route('/api/ping')
-def api_ping():
+def ping():
     db = load_db()
     return jsonify({
         "status": "ok",
@@ -343,7 +254,7 @@ def api_ping():
     })
 
 @flask_app.route('/api/check_license', methods=['POST'])
-def api_check_license():
+def check_license():
     try:
         data = request.json
         email = data.get('email', '').lower().strip()
@@ -356,7 +267,7 @@ def api_check_license():
         key_hash = db["keys"].get(email)
         
         if not key_hash:
-            return jsonify({"valid": False, "error": "Лицензия не найдена для этого email"}), 404
+            return jsonify({"valid": False, "error": "Лицензия не найдена"}), 404
         
         license_data = db["licenses"].get(key_hash)
         if not license_data:
@@ -365,14 +276,12 @@ def api_check_license():
         days_left = (datetime.fromisoformat(license_data["expires"]) - datetime.now()).days
         
         if days_left <= 0:
-            return jsonify({"valid": False, "error": "Лицензия истекла", "days_left": days_left}), 403
+            return jsonify({"valid": False, "error": "Лицензия истекла"}), 403
         
-        # Регистрируем устройство
         if device_id and device_id not in license_data.get("devices", []):
             if len(license_data.get("devices", [])) >= 3:
-                return jsonify({"valid": False, "error": "Достигнут лимит устройств (3)"}), 403
+                return jsonify({"valid": False, "error": "Лимит устройств (3)"}), 403
             license_data["devices"] = license_data.get("devices", []) + [device_id]
-            license_data["activation_count"] = license_data.get("activation_count", 0) + 1
             save_db(db)
         
         return jsonify({
@@ -381,15 +290,14 @@ def api_check_license():
             "days": license_data["days"],
             "days_left": days_left,
             "expires": license_data["expires"],
-            "devices": len(license_data.get("devices", [])),
-            "max_devices": 3
+            "devices": len(license_data.get("devices", []))
         })
     
     except Exception as e:
         return jsonify({"valid": False, "error": str(e)}), 500
 
 @flask_app.route('/api/activate_key', methods=['POST'])
-def api_activate_key():
+def activate_key():
     try:
         data = request.json
         key = data.get('key', '').replace('-', '').upper().strip()
@@ -406,7 +314,7 @@ def api_activate_key():
         license_data = db["licenses"].get(key)
         
         if not license_data:
-            return jsonify({"valid": False, "error": "Ключ не найден в базе"}), 404
+            return jsonify({"valid": False, "error": "Ключ не найден"}), 404
         
         days_left = (datetime.fromisoformat(license_data["expires"]) - datetime.now()).days
         
@@ -419,45 +327,30 @@ def api_activate_key():
         
         if device_id and device_id not in license_data.get("devices", []):
             if len(license_data.get("devices", [])) >= 3:
-                return jsonify({"valid": False, "error": "Достигнут лимит устройств (3)"}), 403
+                return jsonify({"valid": False, "error": "Лимит устройств (3)"}), 403
             license_data["devices"] = license_data.get("devices", []) + [device_id]
         
         license_data["activated"] = True
-        license_data["activation_count"] = license_data.get("activation_count", 0) + 1
         save_db(db)
         
         return jsonify({
             "valid": True,
-            "key": license_data["key"],
-            "email": license_data.get("email", ""),
             "days": license_data["days"],
             "days_left": days_left,
             "expires": license_data["expires"],
-            "devices": len(license_data.get("devices", [])),
-            "activated": True
+            "devices": len(license_data.get("devices", []))
         })
     
     except Exception as e:
         return jsonify({"valid": False, "error": str(e)}), 500
 
-@flask_app.route('/api/validate_key', methods=['POST'])
-def api_validate_key():
-    try:
-        data = request.json
-        key = data.get('key', '')
-        is_valid = validate_key_format(key)
-        return jsonify({"valid_format": is_valid, "key": key})
-    except:
-        return jsonify({"valid_format": False})
-
 # ============================================
 # ЗАПУСК
 # ============================================
 def run_bot():
-    """Запуск Telegram бота"""
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("paid", paid_command))
+    app.add_handler(CommandHandler("paid", paid))
     app.add_handler(CallbackQueryHandler(button_handler))
     print("🤖 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -467,7 +360,12 @@ if __name__ == '__main__':
     print("👑 HESERA PRO Server")
     print("=" * 50)
     
-    # Запускаем Flask API в отдельном потоке
+    # Запускаем автопинг (чтобы не засыпал)
+    ping_thread = threading.Thread(target=auto_ping, daemon=True)
+    ping_thread.start()
+    print("🔄 Автопинг запущен (каждые 5 мин)")
+    
+    # Запускаем Flask API
     port = int(os.environ.get('PORT', 5000))
     flask_thread = threading.Thread(
         target=lambda: flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False),
